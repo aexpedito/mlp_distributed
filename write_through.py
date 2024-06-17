@@ -6,6 +6,11 @@ from dotenv import load_dotenv
 import psycopg2
 import redis
 import pika
+import multiprocessing as mp
+import random
+from time import sleep
+
+semaphore = mp.Semaphore(1)
 
 load_dotenv()
 
@@ -31,27 +36,28 @@ def exec_sql(query: str) -> list[tuple[Any, ...]]:
         print(err)
         return
 
-def send_to_queue(message):
-    parameters = pika.ConnectionParameters(os.getenv("REDIS_HOST"),os.getenv("REDIS_PORT"),"/",pika.PlainCredentials(os.getenv("REDIS_USER"),os.getenv("REDIS_PASS")))
-    connection = pika.BlockingConnection(parameters)
-    channel = connection.channel()
+def send_to_queue(message, semaphore):
+    #publish na fila controlado pelo semaforo
+    with semaphore:
+        parameters = pika.ConnectionParameters(os.getenv("REDIS_HOST"),os.getenv("REDIS_PORT"),"/",pika.PlainCredentials(os.getenv("REDIS_USER"),os.getenv("REDIS_PASS")))
+        connection = pika.BlockingConnection(parameters)
+        channel = connection.channel()
 
-    queue_name = os.getenv("REDIS_QUEUE")
-    channel.queue_declare(queue=queue_name)
+        queue_name = os.getenv("REDIS_QUEUE")
+        channel.queue_declare(queue=queue_name)
 
-    channel.basic_publish(exchange="", routing_key=queue_name, body=message)
-    print(f"Sent: {message}")
-    connection.close()
+        channel.basic_publish(exchange="", routing_key=queue_name, body=message)
+        print(f"Sent: {message}")
+        connection.close()
 
 
-def update(album_id, title):
+def update(album_id, title, semaphore):
     query = f"UPDATE album SET title = '{title}' WHERE album_id = {album_id}"
 
     #atualiza a cache
     REDIS_CLIENT.set(f"sql:album-title:{album_id}", title, ex=3600)
 
     # disparar a atualizacao assíncrona, para atualizar o Postgres
-
     #cria a mensagem para a fila:
     message = json.dumps(
         {
@@ -61,20 +67,36 @@ def update(album_id, title):
     )
 
     #envia a mensagem para a fila
-    send_to_queue(message)
+    send_to_queue(message, semaphore)
 
-    return 0
+def process_updates(max, semaphore):
+    #atualiza o album_id aleatorio
+    album_id = random.randint(1, max)
+    title = "Updated!!!"
+    update(album_id, title, semaphore)
 
 def main():
-
+    print("START")
     #carrega dados do banco no redis
     rows = exec_sql("select album_id, title from album")
     for row in rows:
         REDIS_CLIENT.set(f"sql:album-title:{row[0]}", row[1], ex=3600)
 
-    #update para algumas mensagens
-    for i in range(1, 6):
-        update(i, "Updated!!!")
+    query = "select max(album_id) from album"
+    tuple = exec_sql(query)
+    max = tuple[0][0]
+
+    #update para titles de alguns albuns
+    processes = []
+    while True:
+        for i in range(5):
+            proc = mp.Process(target=process_updates, args=(max, semaphore))
+            proc.start()
+            processes.append(proc)
+        for proc in processes:
+            proc.join()
+        processes = []
+        sleep(5)
 
     print("END")
 

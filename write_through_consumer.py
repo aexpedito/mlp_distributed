@@ -30,7 +30,6 @@ def exec_sql(query: str) -> list[tuple[Any, ...]]:
 
 def work(msg: dict) -> None:
     """Atualiza o Postgres"""
-
     update = msg.get("update")
     exec_sql(update)
 
